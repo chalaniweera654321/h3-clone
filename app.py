@@ -11,13 +11,13 @@ import gradio as gr
 
 COMFY_HOST = "127.0.0.1:8188"
 MODELS_DIR = "/root/ComfyUI/models"
-VOLUME_DIR = "/root/models"  # Adjust if your Modal Volume is mounted elsewhere
+VOLUME_DIR = "/root/models"  # Path to Modal Volume mount
 
 # ---------------------------------------------------------
-# 1. Symlink Models from Modal Volume to ComfyUI
+# 1. Symlink Models from Volume to ComfyUI
 # ---------------------------------------------------------
 def setup_model_symlinks():
-    """Symlinks pre-downloaded models and loras from Modal volume to ComfyUI."""
+    """Symlinks pre-downloaded models and loras from volume to ComfyUI."""
     mappings = {
         "diffusion_models": "diffusion_models",
         "text_encoders": "text_encoders",
@@ -70,7 +70,7 @@ def start_comfyui():
         time.sleep(2)
 
 # ---------------------------------------------------------
-# 3. ComfyUI Dynamic API Workflow with LoRA Injection
+# 3. Dynamic API Workflow Generation
 # ---------------------------------------------------------
 def upload_image_to_comfy(image_path):
     if not image_path:
@@ -83,10 +83,9 @@ def upload_image_to_comfy(image_path):
     return None
 
 def build_workflow_prompt(first_frame_name, last_frame_name, prompt, width, height, duration, seed, lora_name, lora_strength_model, lora_strength_clip):
-    # Calculate frames snapping to MiniMax 17-frame step grid
+    # Calculate total frames aligned to 17-frame step grid for MiniMax H3
     frames = max(5, round(duration * 24)) + (5 - (max(5, round(duration * 24)) % 17)) % 17
     
-    # Base nodes
     model_output = ["6", 0]
     clip_output = ["13", 0]
 
@@ -120,7 +119,7 @@ def build_workflow_prompt(first_frame_name, last_frame_name, prompt, width, heig
         }
     }
 
-    # Inject LoraLoader if a LoRA is selected
+    # Dynamic LoRA Node Injection
     if lora_name and lora_name != "None":
         graph["30"] = {
             "inputs": {
@@ -135,7 +134,7 @@ def build_workflow_prompt(first_frame_name, last_frame_name, prompt, width, heig
         model_output = ["30", 0]
         clip_output = ["30", 1]
 
-    # Standard Execution Nodes
+    # Execution Graph
     graph.update({
         "15": {
             "inputs": {"noise_seed": seed},
@@ -226,7 +225,7 @@ def build_workflow_prompt(first_frame_name, last_frame_name, prompt, width, heig
     return graph
 
 # ---------------------------------------------------------
-# 4. WebSocket Step & Timing Logger Engine
+# 4. Execution Engine & Terminal Logging
 # ---------------------------------------------------------
 def generate_video(first_frame, last_frame, prompt, resolution_str, duration, seed, lora_name, lora_strength_model, lora_strength_clip):
     client_id = str(uuid.uuid4())
@@ -234,7 +233,7 @@ def generate_video(first_frame, last_frame, prompt, resolution_str, duration, se
     
     print("\n" + "="*50)
     print("🚀 STARTING NEW GENERATION TASK")
-    print(f"-> Target: {resolution_str} | Duration: {duration}s | Seed: {seed}")
+    print(f"-> Resolution: {resolution_str} | Duration: {duration}s | Seed: {seed}")
     if lora_name and lora_name != "None":
         print(f"-> LoRA: {lora_name} (Model Str: {lora_strength_model}, CLIP Str: {lora_strength_clip})")
     print("="*50)
@@ -249,16 +248,13 @@ def generate_video(first_frame, last_frame, prompt, resolution_str, duration, se
         lora_name, lora_strength_model, lora_strength_clip
     )
     
-    # Establish WebSocket connection for real-time output
     ws = websocket.WebSocket()
     ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
     
-    # Trigger prompt execution
     res = requests.post(f"http://{COMFY_HOST}/prompt", json={"prompt": prompt_payload, "client_id": client_id})
     prompt_id = res.json().get("prompt_id")
-    print(f"[Backend] Prompt Queued successfully (ID: {prompt_id})")
+    print(f"[Backend] Prompt Queued (ID: {prompt_id})")
 
-    # Real-time WebSocket event loop
     try:
         while True:
             out = ws.recv()
@@ -270,8 +266,8 @@ def generate_video(first_frame, last_frame, prompt, resolution_str, duration, se
                 if msg_type == "executing":
                     node_id = data.get("node")
                     if node_id is None:
-                        print("\n[Backend] All Nodes Executed Completely!")
-                        break  # Finished execution
+                        print("\n[Backend] Execution finished.")
+                        break
                     else:
                         node_class = prompt_payload.get(str(node_id), {}).get("class_type", "Unknown Node")
                         print(f"\n[Backend] ⚙️ Executing Node {node_id} ({node_class})...")
@@ -291,7 +287,6 @@ def generate_video(first_frame, last_frame, prompt, resolution_str, duration, se
     print(f"⏱️ Total Generation Time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)")
     print("="*50 + "\n")
 
-    # Fetch output video from history endpoint
     history = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}").json()
     if prompt_id in history:
         outputs = history[prompt_id].get("outputs", {})
@@ -309,7 +304,7 @@ def generate_video(first_frame, last_frame, prompt, resolution_str, duration, se
     raise RuntimeError("Failed to fetch generated output video from ComfyUI.")
 
 # ---------------------------------------------------------
-# 5. Gradio UI Initialization
+# 5. UI Initialization
 # ---------------------------------------------------------
 if __name__ == "__main__":
     setup_model_symlinks()
@@ -317,7 +312,7 @@ if __name__ == "__main__":
     available_loras = get_available_loras()
 
     with gr.Blocks(title="MiniMax H3 Video Generator") as demo:
-        gr.Markdown("# 🎬 MiniMax H3 Video Generator (LoRA & Real-time Console Logging)")
+        gr.Markdown("# 🎬 MiniMax H3 Video Generator")
         
         with gr.Row():
             with gr.Column():
@@ -329,7 +324,6 @@ if __name__ == "__main__":
                     value="Editorial tech product film. Dark studio background, neon rim lighting..."
                 )
                 
-                # LoRA Configuration Controls
                 with gr.Group():
                     gr.Markdown("### 🎨 LoRA Settings")
                     lora_dropdown = gr.Dropdown(choices=available_loras, value=available_loras[0], label="Select LoRA Model")
