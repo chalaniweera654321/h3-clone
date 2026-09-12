@@ -1901,24 +1901,9 @@ def create_ui() -> gr.Blocks:
 if __name__ == "__main__":
     demo = create_ui()
 
-    # Gradio's default server binding is not ideal for notebook/cloud access.
     demo.launch(
-        server_name=os.environ.get(
-            "GRADIO_SERVER_NAME",
-            "0.0.0.0",
-        ),
-        server_port=int(
-            os.environ.get(
-                "GRADIO_SERVER_PORT",
-                "7860",
-            )
-        ),
-        share=(
-            os.environ.get(
-                "GRADIO_SHARE",
-                "false",
-            ).lower()
-            == "true"
-        ),
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
         show_error=True,
     )
