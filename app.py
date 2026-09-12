@@ -1,287 +1,1817 @@
-import os, sys, time, uuid, json, subprocess
+import os
+import sys
+import json
+import time
+import uuid
+import shutil
+import socket
+import subprocess
 from pathlib import Path
-import gradio as gr
+
 import requests
+import gradio as gr
 
-# Simple paths for your Modal notebook.
-COMFY_ROOT = Path('/root/ComfyUI')
-MODEL_ROOT = Path('/mnt/minimax-h3-models')
-COMFY_URL = 'http://127.0.0.1:8188'
-VIDEO_MODEL = '10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot_skip_edges.safetensors'
-TEXT_ENCODER = 'qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors'
-VIDEO_VAE = 'minimax_h3_video_vae_fp16.safetensors'
-AUDIO_VAE = 'minimax_h3_audio_vae_fp32.safetensors'
-UPSCALER = 'minimax_h3_latent_upscaler_3d_fp16.safetensors'
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+COMFY_ROOT = Path("/root/ComfyUI")
+MODEL_ROOT = Path("/mnt/minimax-h3-models")
+
+COMFY_URL = "http://127.0.0.1:8188"
+
+VIDEO_MODEL = "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot_skip_edges.safetensors"
+TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
+AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+UPSCALER = "minimax_h3_latent_upscaler_3d_fp16.safetensors"
+
+UPSCALE_REPO = (
+    "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale"
+)
+
+OUTPUT_DIR = Path("/tmp/minimax_h3_results")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 PROCESS = None
-RUNNING = False
-
-DEFAULT_PROMPT = '''integrated_multimodal_description: [Shot 1] Photorealistic cinematic shot, 85mm lens at f/1.8, shallow depth of field with creamy bokeh. A beautiful young woman in her mid-twenties stands on a weathered wooden causeway stretching over a windswept beach, leaning back casually against the salt-faded white railing with one elbow resting on it, her weight shifted onto one hip in an effortlessly confident, playful stance.
-
-She has vibrant honey-red auburn hair catching the golden hour light, loose strands whipping gently across her face and lifting in the warm ocean breeze, sunlit edges glowing like copper filaments against the sky. Her expression is a soft, genuine half-smile with slightly squinted eyes from the sunlight, radiating warmth, mischief, and quiet self-assurance. Faint freckles dust her nose and cheekbones.
-
-She wears a flowing ivory-and-blush chiffon sundress that billows and ripples in the wind, fabric translucent where the low sun shines through it, hugging her figure then trailing away like liquid silk.
-
-Behind her the Atlantic horizon meets a dramatic sky painted in peach, apricot, and lavender, soft cirrus clouds streaked gold. Distant waves break in slow white foam; wet sand reflects the sunset like polished glass.
-
-Warm late-afternoon sunlight rakes across her face from camera-left, luminous rim lighting on her hair and shoulders. Natural skin texture, Kodak Portra 400 color science, soft film grain, cinematic teal-orange grading. The camera holds a medium-wide shot along the causeway, slightly below eye level. She looks toward the camera with a relaxed smile, then turns her face toward the sea. Single continuous shot, no cuts, no on-screen text.
-
-overall_soundscape: Soft ocean waves, distant seagulls, light wind across the wooden railing, chiffon fabric rustling.
-
-non_diegetic_music: Gentle acoustic guitar, warm and unobtrusive.'''
 
 
-def log(x): print('[H3]', x, flush=True)
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log(message):
+    print(f"[APP] {message}", flush=True)
 
 
-def model_path(category, name):
-    p = MODEL_ROOT / category / name
-    if p.exists(): return p
-    found = list(MODEL_ROOT.rglob(name))
-    return found[0] if found else None
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def port_open(host="127.0.0.1", port=8188):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1)
+    try:
+        sock.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        sock.close()
 
 
-def setup_models():
-    log('STEP 1/7 - Checking model volume')
-    if not COMFY_ROOT.exists(): raise RuntimeError(f'ComfyUI not found: {COMFY_ROOT}')
-    needed = [('diffusion_models', VIDEO_MODEL), ('text_encoders', TEXT_ENCODER),
-              ('vae', VIDEO_VAE), ('vae', AUDIO_VAE), ('latent_upscale_models', UPSCALER)]
+def wait_for_comfy(timeout=300):
+    log("Waiting for ComfyUI...")
+
+    end = time.time() + timeout
+
+    while time.time() < end:
+        if port_open():
+            try:
+                r = requests.get(
+                    COMFY_URL + "/system_stats",
+                    timeout=5,
+                )
+
+                if r.ok:
+                    log("ComfyUI is ready.")
+                    return True
+
+            except Exception:
+                pass
+
+        time.sleep(2)
+
+    raise RuntimeError(
+        "ComfyUI did not become ready within the timeout."
+    )
+
+
+# ============================================================
+# MODEL CHECKS
+# ============================================================
+
+def check_models():
+    log("Checking models...")
+
+    required = {
+        "diffusion_models": VIDEO_MODEL,
+        "text_encoders": TEXT_ENCODER,
+        "vae": VIDEO_VAE,
+        "vae_audio": AUDIO_VAE,
+        "latent_upscale_models": UPSCALER,
+    }
+
     missing = []
-    for cat, name in needed:
-        p = model_path(cat, name)
-        log(('OK   ' if p else 'MISS ') + f'{cat}/{name}')
-        if not p: missing.append(f'{cat}/{name}')
-    if missing: raise RuntimeError('Missing models:\n' + '\n'.join('  '+x for x in missing))
 
-    log('STEP 2/7 - Making Modal Volume visible to ComfyUI')
-    root = COMFY_ROOT / 'models'; root.mkdir(exist_ok=True)
-    for cat in ['diffusion_models','text_encoders','vae','latent_upscale_models','loras']:
-        src = MODEL_ROOT / cat; src.mkdir(parents=True, exist_ok=True)
-        dst = root / cat
-        if not dst.exists():
-            dst.symlink_to(src, target_is_directory=True)
-        elif dst.is_dir() and not dst.is_symlink():
-            for f in src.rglob('*'):
-                if f.is_file():
-                    out = dst / f.relative_to(src); out.parent.mkdir(parents=True, exist_ok=True)
-                    if not out.exists():
-                        try: out.symlink_to(f)
-                        except Exception: pass
+    for category, filename in required.items():
+
+        if category == "vae_audio":
+            path = MODEL_ROOT / "vae" / filename
+        else:
+            path = MODEL_ROOT / category / filename
+
+        if path.exists() and path.stat().st_size > 0:
+            size_gb = path.stat().st_size / (1024 ** 3)
+            log(
+                f"OK: {category}/{filename} "
+                f"({size_gb:.2f} GB)"
+            )
+        else:
+            missing.append(str(path))
+            log(f"MISSING: {path}")
+
+    if missing:
+        raise RuntimeError(
+            "Required models are missing:\n\n"
+            + "\n".join(missing)
+        )
+
+    log("All required models are present.")
 
 
-def install_extra_node():
-    log('STEP 3/7 - Checking MMH3 Ultimate Upscale node')
-    custom = COMFY_ROOT / 'custom_nodes'; custom.mkdir(exist_ok=True)
-    candidates = [custom/'Comfyui-MMH3-UltimateUpscale', custom/'ComfyUI-MMH3-UltimateUpscale']
-    if any(x.exists() for x in candidates): return
-    log('Node pack missing; installing it...')
-    subprocess.run(['git','clone','--depth','1',
-                    'https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale',
-                    str(custom/'Comfyui-MMH3-UltimateUpscale')], check=True)
+# ============================================================
+# COMFYUI MODEL LINKING
+# ============================================================
 
+def link_models():
+    """
+    The Modal volume is mounted at /mnt/minimax-h3-models.
+    ComfyUI expects models under /root/ComfyUI/models.
+    """
+
+    comfy_models = COMFY_ROOT / "models"
+    comfy_models.mkdir(parents=True, exist_ok=True)
+
+    categories = [
+        "diffusion_models",
+        "text_encoders",
+        "vae",
+        "latent_upscale_models",
+    ]
+
+    for category in categories:
+
+        source = MODEL_ROOT / category
+        target = comfy_models / category
+
+        if not source.exists():
+            continue
+
+        if target.is_symlink():
+            try:
+                if target.resolve() == source.resolve():
+                    log(f"LINK OK: {category}")
+                    continue
+            except Exception:
+                pass
+
+            target.unlink()
+
+        elif target.exists():
+
+            # If ComfyUI already has a real directory,
+            # copy/link individual files instead.
+            log(
+                f"Using existing ComfyUI model directory: "
+                f"{target}"
+            )
+
+            for file in source.iterdir():
+
+                destination = target / file.name
+
+                if destination.exists():
+                    continue
+
+                try:
+                    destination.symlink_to(file)
+                except Exception:
+                    shutil.copy2(file, destination)
+
+            continue
+
+        target.symlink_to(source, target_is_directory=True)
+
+        log(
+            f"Linked {target} -> {source}"
+        )
+
+
+# ============================================================
+# CUSTOM NODE INSTALLATION
+# ============================================================
+
+def install_custom_nodes():
+
+    custom_nodes = COMFY_ROOT / "custom_nodes"
+    custom_nodes.mkdir(parents=True, exist_ok=True)
+
+    node_dir = (
+        custom_nodes /
+        "Comfyui-MMH3-UltimateUpscale"
+    )
+
+    if node_dir.exists():
+        log("MiniMax H3 Ultimate Upscale node already installed.")
+        return
+
+    log("Installing MiniMax H3 Ultimate Upscale custom node...")
+
+    result = subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            UPSCALE_REPO,
+            str(node_dir),
+        ],
+        cwd=str(COMFY_ROOT),
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to install MiniMax H3 Ultimate Upscale.\n\n"
+            + result.stdout
+            + "\n"
+            + result.stderr
+        )
+
+    log("Ultimate Upscale custom node installed.")
+
+
+# ============================================================
+# START COMFYUI
+# ============================================================
 
 def start_comfy():
+
     global PROCESS
-    log('STEP 4/7 - Starting ComfyUI')
-    PROCESS = subprocess.Popen([
-        sys.executable, str(COMFY_ROOT/'main.py'), '--listen','127.0.0.1',
-        '--port','8188','--lowvram','--force-fp16','--use-ck-attention'
-    ], cwd=COMFY_ROOT, stdout=None, stderr=None)
-    end = time.time()+180
-    while time.time() < end:
-        if PROCESS.poll() is not None: raise RuntimeError('ComfyUI stopped during startup.')
-        try:
-            if requests.get(COMFY_URL+'/system_stats', timeout=2).ok:
-                log('ComfyUI is ready.'); return
-        except Exception: pass
-        time.sleep(1)
-    raise TimeoutError('ComfyUI did not start in 180 seconds.')
+
+    if port_open():
+        log("ComfyUI is already running.")
+        return
+
+    log("Starting ComfyUI...")
+
+    command = [
+        sys.executable,
+        str(COMFY_ROOT / "main.py"),
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        "8188",
+        "--lowvram",
+        "--force-fp16",
+        "--use-ck-attention",
+    ]
+
+    log("Command:")
+    log(" ".join(command))
+
+    PROCESS = subprocess.Popen(
+        command,
+        cwd=str(COMFY_ROOT),
+        stdout=None,
+        stderr=None,
+    )
+
+    wait_for_comfy()
 
 
-def stop_comfy():
-    if PROCESS is not None and PROCESS.poll() is None:
-        try: PROCESS.terminate(); PROCESS.wait(10)
-        except Exception:
-            try: PROCESS.kill()
-            except Exception: pass
+# ============================================================
+# STARTUP
+# ============================================================
+
+def startup():
+
+    log("=" * 70)
+    log("MiniMax H3 Gradio App Starting")
+    log("=" * 70)
+
+    check_models()
+    link_models()
+    install_custom_nodes()
+    start_comfy()
+
+    log("=" * 70)
+    log("Startup complete.")
+    log("=" * 70)
 
 
-def upload_image(path):
-    if not path: return None
-    with open(path,'rb') as f:
-        r=requests.post(COMFY_URL+'/upload/image', files={'image':(Path(path).name,f)},
-                        data={'overwrite':'true','type':'input'}, timeout=120)
-    r.raise_for_status(); d=r.json()
-    return f"{d.get('subfolder','')}/{d['name']}".lstrip('/')
+# ============================================================
+# COMFY API
+# ============================================================
 
+def queue_prompt(workflow):
 
-def frames(seconds):
-    n=max(5,round(float(seconds)*24))
-    return n+(5-(n%17))%17
+    log("Sending workflow to ComfyUI...")
 
-
-def size_for(aspect, mp):
-    ratios={'9:16':9/16,'16:9':16/9,'1:1':1,'4:3':4/3,'3:4':3/4}
-    ratio=ratios[aspect]; pixels=float(mp)*1_000_000
-    w=(pixels*ratio)**0.5; h=w/ratio
-    return max(32,round(w/32)*32), max(32,round(h/32)*32)
-
-
-def workflow(prompt,s1w,s1h,s2w,s2h,duration,seed,first,last,loras):
-    length=frames(duration)
-    w={
-      '119':{'class_type':'VAELoader','inputs':{'vae_name':VIDEO_VAE}},
-      '120':{'class_type':'VAELoader','inputs':{'vae_name':AUDIO_VAE}},
-      '127':{'class_type':'UNETLoader','inputs':{'unet_name':VIDEO_MODEL,'weight_dtype':'default'}},
-      '128':{'class_type':'CLIPLoader','inputs':{'clip_name':TEXT_ENCODER,'type':'minimax','device':'default'}},
-      '144':{'class_type':'MiniMaxH3SigmaShift','inputs':{'model':['127',0],'shift_video':12,'shift_audio':3}},
-      '173':{'class_type':'ModelAttentionBackend','inputs':{'model':['144',0],'attention':'comfy kitchen attention'}},
-      '123':{'class_type':'KSamplerSelect','inputs':{'sampler_name':'euler'}},
-      '124':{'class_type':'BasicScheduler','inputs':{'model':['173',0],'scheduler':'simple','steps':6,'denoise':1.0}},
-      '129':{'class_type':'RandomNoise','inputs':{'noise_seed':int(seed)}},
-      '131':{'class_type':'MiniMaxH3ImageToVideo','inputs':{'clip':['128',0],'vae':['119',0],'prompt':prompt,'width':int(s1w),'height':int(s1h),'length':int(length)}},
-      '126':{'class_type':'BasicGuider','inputs':{'model':['173',0],'conditioning':['131',0]}},
-      '125':{'class_type':'SamplerCustomAdvanced','inputs':{'noise':['129',0],'guider':['126',0],'sampler':['123',0],'sigmas':['124',0],'latent_image':['131',1]}},
-      '122':{'class_type':'VAEDecode','inputs':{'samples':['125',0],'vae':['119',0]}},
-      '121':{'class_type':'VAEDecodeAudio','inputs':{'samples':['125',0],'vae':['120',0]}},
-      '130':{'class_type':'CreateVideo','inputs':{'images':['122',0],'audio':['121',0],'fps':24,'bit_depth':8}},
-      '164':{'class_type':'MiniMaxH3ImageToVideo','inputs':{'clip':['128',0],'vae':['119',0],'prompt':prompt,'width':int(s2w),'height':int(s2h),'length':int(length)}},
-      '160':{'class_type':'MMH3LatentUpscaleWithModelParams','inputs':{'model_name':UPSCALER,'width':int(s2w),'height':int(s2h),'device':'cuda','precision':'fp16'}},
-      '161':{'class_type':'MMH3TemporalSplitParams','inputs':{'chunk_length':1020,'temporal_overlap':34,'anchor_strength':0.999}},
-      '162':{'class_type':'MMH3SpatialSplitParams','inputs':{'tile_width':512,'tile_height':384,'spatial_w_overlap':128,'spatial_h_overlap':128,'fade_width':32,'fade_height':32,'min_tile_size':256,'overlap_mode':'earlier','overlap_blend':'linear'}},
-      '165':{'class_type':'RandomNoise','inputs':{'noise_seed':int(seed)+1}},
-      '175':{'class_type':'KSamplerSelect','inputs':{'sampler_name':'euler'}},
-      '167':{'class_type':'BasicScheduler','inputs':{'model':['173',0],'scheduler':'simple','steps':6,'denoise':0.18}},
-      '163':{'class_type':'MMH3UltimateUpscale','inputs':{'model':['173',0],'conditioning':['164',0],'latent':['125',0],'noise':['165',0],'sampler':['175',0],'sigmas':['167',0],'negative':None,'latent_upscale_param':['160',0],'temporal_split_param':['161',0],'spatial_split_param':['162',0],'cfg':1}},
-      '170':{'class_type':'VAEDecode','inputs':{'samples':['163',0],'vae':['119',0]}},
-      '171':{'class_type':'VAEDecodeAudio','inputs':{'samples':['163',0],'vae':['120',0]}},
-      '172':{'class_type':'CreateVideo','inputs':{'images':['170',0],'audio':['171',0],'fps':24,'bit_depth':8}},
-      '155':{'class_type':'SaveVideo','inputs':{'video':['130',0],'filename_prefix':'video/MiniMax_H3_Original','format':'auto','codec':'auto'}},
-      '92':{'class_type':'SaveVideo','inputs':{'video':['172',0],'filename_prefix':'video/MiniMax_H3_UltimateUpscale','format':'auto','codec':'auto'}},
+    payload = {
+        "prompt": workflow,
+        "client_id": str(uuid.uuid4()),
     }
-    if first:
-        w['900']={'class_type':'LoadImage','inputs':{'image':first}}
-        w['131']['inputs']['first_frame']=['900',0]; w['164']['inputs']['first_frame']=['900',0]
-    if last:
-        w['901']={'class_type':'LoadImage','inputs':{'image':last}}
-        w['131']['inputs']['last_frame']=['901',0]; w['164']['inputs']['last_frame']=['901',0]
-    previous='127'
-    for i,(name,weight) in enumerate(loras):
-        nid=str(180+i)
-        w[nid]={'class_type':'LoraLoaderModelOnly','inputs':{'model':[previous,0],'lora_name':name,'strength_model':float(weight)}}
-        previous=nid
-    if loras: w['144']['inputs']['model']=[previous,0]
-    return w
+
+    r = requests.post(
+        COMFY_URL + "/prompt",
+        json=payload,
+        timeout=60,
+    )
+
+    if not r.ok:
+        raise RuntimeError(
+            "ComfyUI rejected the workflow.\n\n"
+            f"HTTP {r.status_code}\n\n"
+            f"{r.text}"
+        )
+
+    data = r.json()
+
+    if "error" in data:
+        raise RuntimeError(
+            "ComfyUI workflow error:\n\n"
+            + json.dumps(
+                data,
+                indent=2,
+            )
+        )
+
+    if "prompt_id" not in data:
+        raise RuntimeError(
+            "ComfyUI did not return a prompt_id.\n\n"
+            + json.dumps(
+                data,
+                indent=2,
+            )
+        )
+
+    prompt_id = data["prompt_id"]
+
+    log(f"Prompt ID: {prompt_id}")
+
+    return prompt_id
 
 
-def submit(w):
-    r=requests.post(COMFY_URL+'/prompt',json={'prompt':w,'client_id':str(uuid.uuid4())},timeout=120)
-    if not r.ok: raise RuntimeError(f'ComfyUI rejected workflow:\n{r.text}')
-    d=r.json()
-    if d.get('error'): raise RuntimeError(json.dumps(d,indent=2))
-    return d['prompt_id']
+# ============================================================
+# WAIT FOR HISTORY
+# ============================================================
 
+def wait_history(prompt_id):
 
-def wait_history(pid):
-    end=time.time()+3600
-    while time.time()<end:
+    log("Waiting for ComfyUI generation...")
+
+    end = time.time() + 3600
+
+    last_status = None
+    last_print = 0
+
+    while time.time() < end:
+
         try:
-            r=requests.get(COMFY_URL+f'/history/{pid}',timeout=10)
-            if r.ok and pid in r.json(): return r.json()[pid]
-        except Exception: pass
-        time.sleep(2)
-    raise TimeoutError('Timed out waiting for ComfyUI.')
 
+            r = requests.get(
+                COMFY_URL + f"/history/{prompt_id}",
+                timeout=15,
+            )
+
+            if r.ok:
+
+                data = r.json()
+
+                if prompt_id in data:
+
+                    history = data[prompt_id]
+
+                    status = history.get(
+                        "status",
+                        {},
+                    )
+
+                    status_str = status.get(
+                        "status_str"
+                    )
+
+                    completed = status.get(
+                        "completed",
+                        False,
+                    )
+
+                    if (
+                        status_str != last_status
+                        or time.time() - last_print > 10
+                    ):
+
+                        log(
+                            f"ComfyUI status: "
+                            f"{status_str}, "
+                            f"completed={completed}"
+                        )
+
+                        last_status = status_str
+                        last_print = time.time()
+
+                    # ------------------------------------------------
+                    # IMPORTANT:
+                    # Catch ComfyUI errors here instead of waiting
+                    # until fetch_video().
+                    # ------------------------------------------------
+
+                    if status_str == "error":
+
+                        messages = status.get(
+                            "messages",
+                            [],
+                        )
+
+                        log("COMFYUI REPORTED AN ERROR")
+
+                        raise RuntimeError(
+                            "ComfyUI generation failed:\n\n"
+                            + json.dumps(
+                                messages,
+                                indent=2,
+                            )
+                        )
+
+                    # ComfyUI normally gives outputs once execution
+                    # has completed.
+                    if completed or status_str in (
+                        "success",
+                        "completed",
+                    ):
+
+                        log("ComfyUI reports generation complete.")
+
+                        return history
+
+                    # Some versions don't expose completed=True
+                    # consistently. If outputs already exist, allow
+                    # the next stage to inspect them.
+                    if history.get("outputs"):
+
+                        return history
+
+        except RuntimeError:
+            raise
+
+        except Exception as e:
+
+            log(
+                f"History polling error: {type(e).__name__}: {e}"
+            )
+
+        time.sleep(2)
+
+    raise TimeoutError(
+        "Timed out waiting for ComfyUI generation."
+    )
+
+
+# ============================================================
+# RECURSIVE OUTPUT SEARCH
+# ============================================================
+
+def find_video_items(obj):
+
+    """
+    ComfyUI custom nodes do not always return exactly the same
+    output dictionary structure.
+
+    Search recursively for video/file/image-like entries.
+    """
+
+    found = []
+
+    def walk(value):
+
+        if isinstance(value, dict):
+
+            # ----------------------------------------------------
+            # A normal ComfyUI file object
+            # ----------------------------------------------------
+
+            if "filename" in value:
+
+                filename = value.get("filename")
+
+                if filename:
+                    found.append(value.copy())
+
+            # ----------------------------------------------------
+            # Continue recursively
+            # ----------------------------------------------------
+
+            for child in value.values():
+                walk(child)
+
+        elif isinstance(value, list):
+
+            for child in value:
+                walk(child)
+
+    walk(obj)
+
+    # Deduplicate
+    unique = []
+    seen = set()
+
+    for item in found:
+
+        key = (
+            item.get("filename"),
+            item.get("subfolder", ""),
+            item.get("type", "output"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(item)
+
+    return unique
+
+
+# ============================================================
+# FETCH VIDEO
+# ============================================================
 
 def fetch_video(history):
-    items=[]
-    for out in history.get('outputs',{}).values():
-        for key in ('videos','gifs','files'):
-            items += out.get(key,[]) or []
-    if not items: raise RuntimeError('ComfyUI finished but returned no video.')
-    item=next((x for x in items if 'UltimateUpscale' in x.get('filename','')),items[-1])
-    r=requests.get(COMFY_URL+'/view',params={'filename':item['filename'],'subfolder':item.get('subfolder',''),'type':item.get('type','output')},timeout=600)
-    r.raise_for_status()
-    out=Path('/tmp/minimax_h3_results'); out.mkdir(exist_ok=True)
-    p=out/(uuid.uuid4().hex+'_'+item['filename']); p.write_bytes(r.content)
-    return str(p)
+
+    log("=" * 60)
+    log("Inspecting ComfyUI outputs...")
+    log("=" * 60)
+
+    outputs = history.get("outputs", {})
+
+    # ------------------------------------------------------------
+    # VERY IMPORTANT DEBUGGING
+    # ------------------------------------------------------------
+
+    if not outputs:
+
+        log("WARNING: ComfyUI returned ZERO output nodes.")
+
+        log("FULL HISTORY:")
+        print(
+            json.dumps(
+                history,
+                indent=2,
+                default=str,
+            ),
+            flush=True,
+        )
+
+        raise RuntimeError(
+            "ComfyUI finished, but the workflow produced no "
+            "output nodes. Check the ComfyUI terminal above "
+            "for the actual node error."
+        )
+
+    log(
+        "Output node IDs: "
+        + ", ".join(str(x) for x in outputs.keys())
+    )
+
+    # ------------------------------------------------------------
+    # Print every output node
+    # ------------------------------------------------------------
+
+    for node_id, node_output in outputs.items():
+
+        log(
+            f"Output node {node_id}: "
+            + json.dumps(
+                node_output,
+                indent=2,
+                default=str,
+            )
+        )
+
+    # ------------------------------------------------------------
+    # Find all file objects recursively
+    # ------------------------------------------------------------
+
+    items = find_video_items(outputs)
+
+    if not items:
+
+        log("No filename objects found in ComfyUI outputs.")
+
+        log(
+            "FULL OUTPUT SECTION:"
+        )
+
+        print(
+            json.dumps(
+                outputs,
+                indent=2,
+                default=str,
+            ),
+            flush=True,
+        )
+
+        raise RuntimeError(
+            "ComfyUI finished, but no video file was returned. "
+            "The SaveVideo node may not have executed."
+        )
+
+    log(f"Found {len(items)} file object(s).")
+
+    # ------------------------------------------------------------
+    # Print discovered files
+    # ------------------------------------------------------------
+
+    for i, item in enumerate(items):
+
+        log(
+            f"[{i}] "
+            f"filename={item.get('filename')} "
+            f"subfolder={item.get('subfolder', '')} "
+            f"type={item.get('type', 'output')}"
+        )
+
+    # ------------------------------------------------------------
+    # Prefer the final UltimateUpscale output
+    # ------------------------------------------------------------
+
+    def is_video(item):
+
+        filename = str(
+            item.get("filename", "")
+        ).lower()
+
+        return filename.endswith(
+            (
+                ".mp4",
+                ".webm",
+                ".mov",
+                ".mkv",
+                ".avi",
+                ".gif",
+            )
+        )
+
+    upscale_items = [
+        x for x in items
+        if "UltimateUpscale" in
+        str(x.get("filename", ""))
+    ]
+
+    if upscale_items:
+
+        item = upscale_items[-1]
+
+        log(
+            "Selected UltimateUpscale output: "
+            + str(item.get("filename"))
+        )
+
+    else:
+
+        video_items = [
+            x for x in items
+            if is_video(x)
+        ]
+
+        if video_items:
+
+            item = video_items[-1]
+
+            log(
+                "Selected video output: "
+                + str(item.get("filename"))
+            )
+
+        else:
+
+            item = items[-1]
+
+            log(
+                "No obvious video extension found; "
+                "using final file object: "
+                + str(item.get("filename"))
+            )
+
+    # ------------------------------------------------------------
+    # Download using /view
+    # ------------------------------------------------------------
+
+    filename = item.get("filename")
+
+    if not filename:
+        raise RuntimeError(
+            "ComfyUI returned an output entry without a filename."
+        )
+
+    params = {
+        "filename": filename,
+        "subfolder": item.get(
+            "subfolder",
+            "",
+        ),
+        "type": item.get(
+            "type",
+            "output",
+        ),
+    }
+
+    log(
+        "Downloading from ComfyUI /view:"
+    )
+
+    log(
+        f"filename={params['filename']}"
+    )
+
+    log(
+        f"subfolder={params['subfolder']}"
+    )
+
+    log(
+        f"type={params['type']}"
+    )
+
+    r = requests.get(
+        COMFY_URL + "/view",
+        params=params,
+        timeout=600,
+    )
+
+    if not r.ok:
+
+        raise RuntimeError(
+            "ComfyUI generated the file, but /view failed.\n\n"
+            f"HTTP {r.status_code}\n\n"
+            f"{r.text[:2000]}"
+        )
+
+    if not r.content:
+
+        raise RuntimeError(
+            "ComfyUI /view returned an empty file."
+        )
+
+    # ------------------------------------------------------------
+    # Save locally
+    # ------------------------------------------------------------
+
+    safe_name = Path(filename).name
+
+    output_path = (
+        OUTPUT_DIR /
+        f"{uuid.uuid4().hex}_{safe_name}"
+    )
+
+    output_path.write_bytes(
+        r.content
+    )
+
+    log(
+        f"Downloaded result: {output_path}"
+    )
+
+    log(
+        f"File size: "
+        f"{output_path.stat().st_size / (1024 ** 2):.2f} MB"
+    )
+
+    return str(output_path)
 
 
-def lora_list():
-    d=MODEL_ROOT/'loras'
-    if not d.exists(): return []
-    return sorted(str(x.relative_to(d)).replace('\\','/') for x in d.rglob('*') if x.is_file() and x.suffix.lower() in {'.safetensors','.ckpt','.pt','.bin'})
+# ============================================================
+# IMAGE UPLOAD
+# ============================================================
+
+def upload_image_to_comfy(image_path):
+
+    if not image_path:
+        return None
+
+    path = Path(image_path)
+
+    if not path.exists():
+        raise RuntimeError(
+            f"Image does not exist: {path}"
+        )
+
+    log(
+        f"Uploading image to ComfyUI: {path.name}"
+    )
+
+    with open(path, "rb") as f:
+
+        r = requests.post(
+            COMFY_URL + "/upload/image",
+            files={
+                "image": (
+                    path.name,
+                    f,
+                    "application/octet-stream",
+                )
+            },
+            data={
+                "overwrite": "true",
+            },
+            timeout=120,
+        )
+
+    if not r.ok:
+
+        raise RuntimeError(
+            "Failed to upload image to ComfyUI.\n\n"
+            + r.text
+        )
+
+    data = r.json()
+
+    log(
+        "Uploaded image: "
+        + json.dumps(data)
+    )
+
+    return data.get(
+        "name",
+        path.name,
+    )
 
 
-def generate(prompt,aspect,s1mp,s2mp,duration,seed,randomize,first,last,*weights):
-    global RUNNING
-    if RUNNING: raise gr.Error('Another generation is already running.')
-    RUNNING=True
+# ============================================================
+# DIMENSION HELPERS
+# ============================================================
+
+def align32(value):
+    return max(
+        32,
+        int(round(value / 32)) * 32,
+    )
+
+
+def calculate_dimensions(
+    aspect_ratio,
+    stage1_mp=0.4,
+    stage2_mp=0.9,
+):
+
+    ratios = {
+        "16:9": 16 / 9,
+        "9:16": 9 / 16,
+        "1:1": 1.0,
+        "4:3": 4 / 3,
+        "3:4": 3 / 4,
+    }
+
+    ratio = ratios.get(
+        aspect_ratio,
+        16 / 9,
+    )
+
+    # ------------------------------------------------------------
+    # Stage 1
+    # ------------------------------------------------------------
+
+    h1 = int(
+        ((stage1_mp * 1_000_000) / ratio) ** 0.5
+    )
+
+    w1 = int(
+        h1 * ratio
+    )
+
+    w1 = align32(w1)
+    h1 = align32(h1)
+
+    # ------------------------------------------------------------
+    # Stage 2
+    # ------------------------------------------------------------
+
+    h2 = int(
+        ((stage2_mp * 1_000_000) / ratio) ** 0.5
+    )
+
+    w2 = int(
+        h2 * ratio
+    )
+
+    w2 = align32(w2)
+    h2 = align32(h2)
+
+    return w1, h1, w2, h2
+
+
+# ============================================================
+# WORKFLOW
+# ============================================================
+
+def build_workflow(
+    prompt,
+    duration,
+    aspect_ratio,
+    first_frame=None,
+    last_frame=None,
+    lora_name=None,
+    lora_strength=1.0,
+):
+
+    # ------------------------------------------------------------
+    # Dimensions
+    # ------------------------------------------------------------
+
+    s1w, s1h, s2w, s2h = calculate_dimensions(
+        aspect_ratio,
+        stage1_mp=0.4,
+        stage2_mp=0.9,
+    )
+
+    # ------------------------------------------------------------
+    # H3 frame calculation
+    #
+    # Source workflow uses:
+    #
+    # max(5, round(a * 24))
+    # + (5 - (max(5, round(a * 24)) % 17)) % 17
+    #
+    # ------------------------------------------------------------
+
+    raw_frames = max(
+        5,
+        round(float(duration) * 24),
+    )
+
+    length = (
+        raw_frames
+        + (
+            5
+            - (
+                raw_frames % 17
+            )
+        ) % 17
+    )
+
+    log(
+        f"Stage 1: {s1w}x{s1h}"
+    )
+
+    log(
+        f"Stage 2: {s2w}x{s2h}"
+    )
+
+    log(
+        f"Duration: {duration}s"
+    )
+
+    log(
+        f"Frames: {length}"
+    )
+
+    # ------------------------------------------------------------
+    # Uploaded images
+    # ------------------------------------------------------------
+
+    first_name = None
+    last_name = None
+
+    if first_frame:
+        first_name = upload_image_to_comfy(
+            first_frame
+        )
+
+    if last_frame:
+        last_name = upload_image_to_comfy(
+            last_frame
+        )
+
+    # ------------------------------------------------------------
+    # Basic source workflow
+    # ------------------------------------------------------------
+
+    workflow = {
+
+        # --------------------------------------------------------
+        # Video VAE
+        # --------------------------------------------------------
+
+        "119": {
+            "class_type": "VAELoader",
+            "inputs": {
+                "vae_name": VIDEO_VAE,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Audio VAE
+        # --------------------------------------------------------
+
+        "120": {
+            "class_type": "VAELoader",
+            "inputs": {
+                "vae_name": AUDIO_VAE,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Model
+        # --------------------------------------------------------
+
+        "127": {
+            "class_type": "UNETLoader",
+            "inputs": {
+                "unet_name": VIDEO_MODEL,
+                "weight_dtype": "default",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Text encoder
+        # --------------------------------------------------------
+
+        "128": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+                "clip_name": TEXT_ENCODER,
+                "type": "minimax",
+                "device": "default",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Optional LoRA
+        # --------------------------------------------------------
+
+        "129": {
+            "class_type": "RandomNoise",
+            "inputs": {
+                "noise_seed": 0,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Sigma shift
+        # --------------------------------------------------------
+
+        "144": {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {
+                "model": [
+                    "127",
+                    0,
+                ],
+                "shift_video": 12,
+                "shift_audio": 3,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Attention backend
+        # --------------------------------------------------------
+
+        "173": {
+            "class_type": "ModelAttentionBackend",
+            "inputs": {
+                "model": [
+                    "144",
+                    0,
+                ],
+                "attention": "comfy kitchen attention",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Scheduler
+        # --------------------------------------------------------
+
+        "124": {
+            "class_type": "BasicScheduler",
+            "inputs": {
+                "model": [
+                    "173",
+                    0,
+                ],
+                "scheduler": "simple",
+                "steps": 6,
+                "denoise": 1.0,
+            },
+        },
+
+        # --------------------------------------------------------
+        # KSampler
+        # --------------------------------------------------------
+
+        "123": {
+            "class_type": "KSamplerSelect",
+            "inputs": {
+                "sampler_name": "euler",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Guider
+        # --------------------------------------------------------
+
+        "126": {
+            "class_type": "BasicGuider",
+            "inputs": {
+                "model": [
+                    "173",
+                    0,
+                ],
+                "conditioning": [
+                    "131",
+                    0,
+                ],
+            },
+        },
+
+        # --------------------------------------------------------
+        # Image-to-video conditioning
+        # --------------------------------------------------------
+
+        "131": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+                "clip": [
+                    "128",
+                    0,
+                ],
+                "vae": [
+                    "119",
+                    0,
+                ],
+                "prompt": prompt,
+                "width": s1w,
+                "height": s1h,
+                "length": length,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Advanced sampler
+        # --------------------------------------------------------
+
+        "125": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": [
+                    "129",
+                    0,
+                ],
+                "guider": [
+                    "126",
+                    0,
+                ],
+                "sampler": [
+                    "123",
+                    0,
+                ],
+                "sigmas": [
+                    "124",
+                    0,
+                ],
+                "latent_image": [
+                    "131",
+                    0,
+                ],
+            },
+        },
+
+        # --------------------------------------------------------
+        # Upscale conditioning
+        # --------------------------------------------------------
+
+        "164": {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": {
+                "clip": [
+                    "128",
+                    0,
+                ],
+                "vae": [
+                    "119",
+                    0,
+                ],
+                "prompt": prompt,
+                "width": s2w,
+                "height": s2h,
+                "length": length,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Upscaler
+        # --------------------------------------------------------
+
+        "160": {
+            "class_type": "MMH3LatentUpscaleWithModelParams",
+            "inputs": {
+                "model_name": UPSCALER,
+                "width": s2w,
+                "height": s2h,
+                "device": "cuda",
+                "precision": "fp16",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Temporal split
+        # --------------------------------------------------------
+
+        "161": {
+            "class_type": "MMH3TemporalSplitParams",
+            "inputs": {
+                "chunk_length": 1020,
+                "temporal_overlap": 34,
+                "anchor_strength": 0.999,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Spatial split
+        # --------------------------------------------------------
+
+        "162": {
+            "class_type": "MMH3SpatialSplitParams",
+            "inputs": {
+                "tile_width": 512,
+                "tile_height": 384,
+                "overlap_width": 128,
+                "overlap_height": 128,
+                "fade_width": 32,
+                "fade_height": 32,
+                "min_tile_width": 256,
+                "min_tile_height": 256,
+                "overlap_mode": "earlier",
+                "overlap_blend": "linear",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Upscale noise
+        # --------------------------------------------------------
+
+        "165": {
+            "class_type": "RandomNoise",
+            "inputs": {
+                "noise_seed": 0,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Upscale scheduler
+        # --------------------------------------------------------
+
+        "167": {
+            "class_type": "BasicScheduler",
+            "inputs": {
+                "model": [
+                    "173",
+                    0,
+                ],
+                "scheduler": "simple",
+                "steps": 6,
+                "denoise": 0.18,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Upscale sampler
+        # --------------------------------------------------------
+
+        "175": {
+            "class_type": "KSamplerSelect",
+            "inputs": {
+                "sampler_name": "euler",
+            },
+        },
+
+        # --------------------------------------------------------
+        # Ultimate Upscale
+        # --------------------------------------------------------
+
+        "163": {
+            "class_type": "MMH3UltimateUpscale",
+            "inputs": {
+                "model": [
+                    "173",
+                    0,
+                ],
+                "conditioning": [
+                    "164",
+                    0,
+                ],
+                "latent": [
+                    "125",
+                    0,
+                ],
+                "noise": [
+                    "165",
+                    0,
+                ],
+                "sampler": [
+                    "175",
+                    0,
+                ],
+                "sigmas": [
+                    "167",
+                    0,
+                ],
+                "negative": None,
+                "latent_upscale_param": [
+                    "160",
+                    0,
+                ],
+                "temporal_split_param": [
+                    "161",
+                    0,
+                ],
+                "spatial_split_param": [
+                    "162",
+                    0,
+                ],
+                "cfg": 1,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Final video VAE decode
+        # --------------------------------------------------------
+
+        "170": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": [
+                    "163",
+                    0,
+                ],
+                "vae": [
+                    "119",
+                    0,
+                ],
+            },
+        },
+
+        # --------------------------------------------------------
+        # Final audio decode
+        # --------------------------------------------------------
+
+        "171": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+                "samples": [
+                    "163",
+                    0,
+                ],
+                "vae": [
+                    "120",
+                    0,
+                ],
+            },
+        },
+
+        # --------------------------------------------------------
+        # Final CreateVideo
+        # --------------------------------------------------------
+
+        "172": {
+            "class_type": "CreateVideo",
+            "inputs": {
+                "images": [
+                    "170",
+                    0,
+                ],
+                "audio": [
+                    "171",
+                    0,
+                ],
+                "fps": 24,
+                "bit_depth": 8,
+            },
+        },
+
+        # --------------------------------------------------------
+        # ORIGINAL OUTPUT
+        # --------------------------------------------------------
+
+        "155": {
+            "class_type": "SaveVideo",
+            "inputs": {
+                "video": [
+                    "130",
+                    0,
+                ],
+                "filename_prefix": "video/MiniMax_H3_Original",
+            },
+        },
+
+        # --------------------------------------------------------
+        # FINAL UPSCALED OUTPUT
+        # --------------------------------------------------------
+
+        "92": {
+            "class_type": "SaveVideo",
+            "inputs": {
+                "video": [
+                    "172",
+                    0,
+                ],
+                "filename_prefix": "video/MiniMax_H3_UltimateUpscale",
+            },
+        },
+
+        # --------------------------------------------------------
+        # ORIGINAL VIDEO
+        # --------------------------------------------------------
+
+        "130": {
+            "class_type": "CreateVideo",
+            "inputs": {
+                "images": [
+                    "122",
+                    0,
+                ],
+                "audio": [
+                    "121",
+                    0,
+                ],
+                "fps": 24,
+                "bit_depth": 8,
+            },
+        },
+
+        # --------------------------------------------------------
+        # Original decode
+        # --------------------------------------------------------
+
+        "122": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": [
+                    "125",
+                    0,
+                ],
+                "vae": [
+                    "119",
+                    0,
+                ],
+            },
+        },
+
+        "121": {
+            "class_type": "VAEDecodeAudio",
+            "inputs": {
+                "samples": [
+                    "125",
+                    0,
+                ],
+                "vae": [
+                    "120",
+                    0,
+                ],
+            },
+        },
+    }
+
+    # ------------------------------------------------------------
+    # Optional first-frame / last-frame
+    #
+    # Only add them when supplied.
+    # ------------------------------------------------------------
+
+    if first_name is not None:
+
+        workflow["131"]["inputs"]["start_image"] = [
+            first_name,
+            0,
+        ]
+
+        workflow["164"]["inputs"]["start_image"] = [
+            first_name,
+            0,
+        ]
+
+    if last_name is not None:
+
+        workflow["131"]["inputs"]["end_image"] = [
+            last_name,
+            0,
+        ]
+
+        workflow["164"]["inputs"]["end_image"] = [
+            last_name,
+            0,
+        ]
+
+    # ------------------------------------------------------------
+    # Optional LoRA
+    # ------------------------------------------------------------
+
+    if lora_name:
+
+        lora_path = (
+            COMFY_ROOT /
+            "models" /
+            "loras" /
+            lora_name
+        )
+
+        if not lora_path.exists():
+            raise RuntimeError(
+                f"LoRA not found: {lora_path}"
+            )
+
+        workflow["127"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": [
+                    "127",
+                    0,
+                ],
+                "lora_name": lora_name,
+                "strength_model": float(
+                    lora_strength
+                ),
+            },
+        }
+
+    return workflow
+
+
+# ============================================================
+# GENERATE
+# ============================================================
+
+def generate(
+    prompt,
+    duration,
+    aspect_ratio,
+    first_frame,
+    last_frame,
+    lora_name,
+    lora_strength,
+    progress=gr.Progress(),
+):
+
     try:
-        if not prompt.strip(): raise gr.Error('Prompt is empty.')
-        seed=int.from_bytes(os.urandom(8),'big')%(2**63-1) if randomize else int(seed)
-        s1w,s1h=size_for(aspect,s1mp); s2w,s2h=size_for(aspect,s2mp)
-        first=upload_image(first) if first else None; last=upload_image(last) if last else None
-        names=lora_list(); loras=[(n,float(v)) for n,v in zip(names,weights) if abs(float(v))>0.0001]
-        log('='*70); log(f'Stage 1: {s1w}x{s1h}'); log(f'Stage 2: {s2w}x{s2h}'); log(f'Frames: {frames(duration)}'); log(f'Seed: {seed}')
-        log(f'LoRAs: {len(loras)}'); log('STEP 5/7 - Building workflow')
-        wf=workflow(prompt,s1w,s1h,s2w,s2h,duration,seed,first,last,loras)
-        pid=submit(wf); log(f'STEP 6/7 - Running: {pid}')
-        debug=COMFY_ROOT/'output'/'_h3_workflows'; debug.mkdir(parents=True,exist_ok=True)
-        (debug/f'{pid}.json').write_text(json.dumps(wf,indent=2),encoding='utf-8')
-        history=wait_history(pid)
-        if history.get('status',{}).get('status_str')=='error': raise RuntimeError(json.dumps(history['status'].get('messages',[]),indent=2))
-        log('STEP 7/7 - Getting final video')
-        result=fetch_video(history)
-        return result,f'Done — seed {seed} — {s1w}×{s1h} → {s2w}×{s2h}'
+
+        if not prompt or not prompt.strip():
+            raise gr.Error(
+                "Please enter a prompt."
+            )
+
+        progress(
+            0.05,
+            desc="Checking ComfyUI..."
+        )
+
+        if not port_open():
+            start_comfy()
+
+        progress(
+            0.10,
+            desc="Building workflow..."
+        )
+
+        log("=" * 70)
+        log("NEW GENERATION")
+        log("=" * 70)
+
+        workflow = build_workflow(
+            prompt=prompt.strip(),
+            duration=float(duration),
+            aspect_ratio=aspect_ratio,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            lora_name=lora_name or None,
+            lora_strength=float(lora_strength),
+        )
+
+        # --------------------------------------------------------
+        # DEBUG: print workflow before queueing
+        # --------------------------------------------------------
+
+        log(
+            "Workflow node count: "
+            + str(len(workflow))
+        )
+
+        progress(
+            0.15,
+            desc="Sending workflow to ComfyUI..."
+        )
+
+        prompt_id = queue_prompt(
+            workflow
+        )
+
+        progress(
+            0.20,
+            desc="Generating video..."
+        )
+
+        history = wait_history(
+            prompt_id
+        )
+
+        # --------------------------------------------------------
+        # Print completion status
+        # --------------------------------------------------------
+
+        log(
+            "FINAL HISTORY STATUS:"
+        )
+
+        print(
+            json.dumps(
+                history.get("status", {}),
+                indent=2,
+                default=str,
+            ),
+            flush=True,
+        )
+
+        progress(
+            0.90,
+            desc="Fetching generated video..."
+        )
+
+        result = fetch_video(
+            history
+        )
+
+        progress(
+            1.0,
+            desc="Done!"
+        )
+
+        log(
+            "Generation completed successfully."
+        )
+
+        return result
+
+    except gr.Error:
+        raise
+
     except Exception as e:
-        log('ERROR: '+str(e)); raise gr.Error(str(e))
-    finally: RUNNING=False
+
+        log("=" * 70)
+        log("GENERATION FAILED")
+        log("=" * 70)
+
+        log(
+            f"{type(e).__name__}: {e}"
+        )
+
+        raise gr.Error(
+            str(e)
+        )
 
 
-def refresh_loras():
-    names=lora_list(); log(f'Found {len(names)} LoRA(s).')
-    return [gr.update(visible=i<len(names),label=f'LoRA {i+1}: {names[i]}' if i<len(names) else f'LoRA {i+1}',value=0) for i in range(20)]
+# ============================================================
+# GRADIO UI
+# ============================================================
+
+def get_loras():
+
+    lora_dir = (
+        COMFY_ROOT /
+        "models" /
+        "loras"
+    )
+
+    if not lora_dir.exists():
+        return []
+
+    return sorted(
+        x.name
+        for x in lora_dir.iterdir()
+        if x.is_file()
+        and x.suffix.lower() in (
+            ".safetensors",
+            ".pt",
+            ".ckpt",
+        )
+    )
 
 
-def create_ui():
-    names=lora_list()
-    with gr.Blocks(title='MiniMax H3 — 10Eros Ultimate Upscale') as demo:
-        gr.Markdown('# MiniMax H3 — 10Eros Ultimate Upscale\n**10Eros TURBO → H3 generation → 3D latent Ultimate Upscale → final video**')
-        with gr.Row():
-            with gr.Column(scale=2):
-                prompt=gr.Textbox(label='Prompt',value=DEFAULT_PROMPT,lines=16)
-                with gr.Row():
-                    first=gr.Image(label='First frame (optional)',type='filepath')
-                    last=gr.Image(label='Last frame (optional)',type='filepath')
-                with gr.Row():
-                    aspect=gr.Dropdown(['9:16','16:9','1:1','4:3','3:4'],value='9:16',label='Aspect ratio')
-                    duration=gr.Slider(1,20,5,step=1,label='Duration (seconds)')
-                with gr.Row():
-                    s1mp=gr.Slider(.20,1.00,.40,step=.05,label='Stage 1 MP')
-                    s2mp=gr.Slider(.30,1.20,.90,step=.05,label='Stage 2 MP')
-                with gr.Row():
-                    seed=gr.Number(value=757358688076805,precision=0,label='Seed')
-                    randomize=gr.Checkbox(True,label='Randomize seed')
-                gr.Markdown('### Style LoRAs — weight 0 disables\n**Do not use speed LoRAs. 10Eros already has turbo baked in.**')
-                sliders=[]
-                for i in range(20):
-                    sliders.append(gr.Slider(-3,3,0,step=.05,visible=i<len(names),label=f'LoRA {i+1}: {names[i]}' if i<len(names) else f'LoRA {i+1}'))
-                with gr.Row():
-                    go=gr.Button('Generate',variant='primary'); refresh=gr.Button('Refresh LoRAs')
-            with gr.Column(scale=1):
-                out=gr.Video(label='Final Ultimate Upscale',autoplay=True)
-                status=gr.Textbox(label='Status',interactive=False)
-                gr.Markdown('### Workflow defaults\n- Stage 1: ~0.4 MP\n- Stage 2: ~0.9 MP\n- euler / simple\n- 6 + 6 steps\n- upscale denoise 0.18\n- tiles 512×384\n- temporal 1020 / 34 / 0.999\n- 24 FPS')
-        go.click(generate,[prompt,aspect,s1mp,s2mp,duration,seed,randomize,first,last,*sliders],[out,status])
-        refresh.click(refresh_loras,[],sliders)
-    return demo
+with gr.Blocks(
+    title="MiniMax H3 Video Generator"
+) as demo:
+
+    gr.Markdown(
+        """
+# MiniMax H3 Video Generator
+
+Generate MiniMax H3 videos using the 10Eros Turbo model and
+MiniMax H3 Ultimate Upscale.
+"""
+    )
+
+    with gr.Row():
+
+        with gr.Column():
+
+            prompt = gr.Textbox(
+                label="Prompt",
+                placeholder=(
+                    "Describe the video you want to generate..."
+                ),
+                lines=8,
+            )
+
+            with gr.Row():
+
+                duration = gr.Number(
+                    label="Duration (seconds)",
+                    value=5,
+                    minimum=1,
+                    maximum=20,
+                    step=1,
+                )
+
+                aspect_ratio = gr.Dropdown(
+                    label="Aspect Ratio",
+                    choices=[
+                        "16:9",
+                        "9:16",
+                        "1:1",
+                        "4:3",
+                        "3:4",
+                    ],
+                    value="9:16",
+                )
+
+            with gr.Row():
+
+                first_frame = gr.Image(
+                    label="First Frame (optional)",
+                    type="filepath",
+                )
+
+                last_frame = gr.Image(
+                    label="Last Frame (optional)",
+                    type="filepath",
+                )
+
+            with gr.Row():
+
+                lora_name = gr.Dropdown(
+                    label="LoRA (optional)",
+                    choices=get_loras(),
+                    value=None,
+                    allow_custom_value=False,
+                )
+
+                lora_strength = gr.Slider(
+                    label="LoRA Strength",
+                    minimum=0,
+                    maximum=2,
+                    value=1,
+                    step=0.05,
+                )
+
+            generate_button = gr.Button(
+                "Generate Video",
+                variant="primary",
+            )
+
+        with gr.Column():
+
+            output_video = gr.Video(
+                label="Generated Video",
+                autoplay=True,
+                interactive=False,
+            )
+
+    generate_button.click(
+        fn=generate,
+        inputs=[
+            prompt,
+            duration,
+            aspect_ratio,
+            first_frame,
+            last_frame,
+            lora_name,
+            lora_strength,
+        ],
+        outputs=output_video,
+    )
 
 
-def main():
-    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True')
-    setup_models(); install_extra_node(); start_comfy()
-    try:
-        create_ui().launch(server_name='0.0.0.0',server_port=7860,share=True,show_error=True)
-    finally: stop_comfy()
+# ============================================================
+# MAIN
+# ============================================================
 
-if __name__=='__main__': main()
+if __name__ == "__main__":
+
+    startup()
+
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
+        show_error=True,
+    )
