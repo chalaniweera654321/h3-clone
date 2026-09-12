@@ -85,7 +85,7 @@ def start_comfy():
     PROCESS = subprocess.Popen([
         sys.executable, str(COMFY_ROOT/'main.py'), '--listen','127.0.0.1',
         '--port','8188','--lowvram','--force-fp16','--use-ck-attention'
-    ], cwd=COMFY_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    ], cwd=COMFY_ROOT, stdout=None, stderr=None)
     end = time.time()+180
     while time.time() < end:
         if PROCESS.poll() is not None: raise RuntimeError('ComfyUI stopped during startup.')
