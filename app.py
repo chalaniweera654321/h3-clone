@@ -65,7 +65,8 @@ def start_comfyui():
             if r.status_code == 200:
                 print("[ComfyUI] Server online and ready!")
                 break
-        except Exception:
+        except Exception as e:
+            print(e)
             pass
         time.sleep(2)
 
