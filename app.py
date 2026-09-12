@@ -661,7 +661,7 @@ def _scan_local_models() -> None:
     for model in LOCAL_BASE_MODELS:
 
         print(
-            "[models]  ",
+            "[models]   ",
             model,
             flush=True,
         )
@@ -677,7 +677,7 @@ def _scan_local_models() -> None:
     for lora in LOCAL_LORAS:
 
         print(
-            "[loras]  ",
+            "[loras]   ",
             lora,
             flush=True,
         )
@@ -1610,1529 +1610,289 @@ def _prepare_edit_image(
 
 
 # ============================================================================
-# STAGE IMAGE
+# EXECUTION HELPER
 # ============================================================================
 
-def _stage_image(
-    path: str,
-    prefix: str,
-) -> str:
-
-    with Image.open(path) as source:
-
-        image = source.convert("RGB")
-
-
-        name = (
-            f"{prefix}_"
-            f"{uuid.uuid4().hex[:12]}"
-            f".png"
-        )
-
-
-        image.save(
-            INPUT / name,
-            format="PNG",
-        )
-
-
-    return name
-
-
-# ============================================================================
-# REQUEST VALIDATION
-# ============================================================================
-
-def _validate_request(
-    mode: str,
-    prompt: str,
-    edit_prompt: str,
-    primary: str | None,
-) -> None:
-
-    if mode not in {
-        "text2image",
-        "edit",
-    }:
-
-        raise ValueError(
-            "unsupported generation mode"
-        )
-
-
-    if (
-        mode == "text2image"
-        and not (prompt or "").strip()
-    ):
-
-        raise ValueError(
-            "enter a prompt"
-        )
-
-
-    if mode == "edit":
-
-        if not primary:
-
-            raise ValueError(
-                "upload a primary image "
-                "for edit mode"
-            )
-
-
-        if not (
-            edit_prompt
-            or prompt
-            or ""
-        ).strip():
-
-            raise ValueError(
-                "enter an edit instruction"
-            )
-
-
-# ============================================================================
-# T2I INJECTION
-# ============================================================================
-
-def _inject_t2i(
-    workflow: dict[str, Any],
-    *,
-    prompt: str,
-    width: int,
-    height: int,
-    steps: int,
-    cfg: float,
-    sampler: str,
-    scheduler: str,
-    seed: int,
-    enabled_loras: list[
-        tuple[str, float]
-    ] | None = None,
-) -> None:
-
-    _inject_lora_chain(
-        workflow,
-        enabled_loras or [],
-        model_source=_ref("1"),
-        clip_source=_ref("2"),
-        model_consumers=[
-            ("4", "model"),
-        ],
-        clip_consumers=[
-            ("5", "clip"),
-        ],
-    )
-
-
-    workflow["5"]["inputs"][
-        "text"
-    ] = prompt.strip()
-
-
-    workflow["7"]["inputs"].update(
-        width=int(width),
-        height=int(height),
-    )
-
-
-    workflow["8"]["inputs"].update(
-        seed=int(seed),
-        steps=int(steps),
-        cfg=float(cfg),
-        sampler_name=sampler,
-        scheduler=scheduler,
-        denoise=1.0,
-    )
-
-
-# ============================================================================
-# EDIT INJECTION
-# ============================================================================
-
-def _inject_edit(
-    workflow: dict[str, Any],
-    *,
-    primary_name: str,
-    second_name: str | None,
-    width: int,
-    height: int,
-    edit_prompt: str,
-    grounding_px: int,
-    ref_boost: float,
-    ref_boost_a: float,
-    steps: int,
-    cfg: float,
-    sampler: str,
-    scheduler: str,
-    seed: int,
-    enabled_loras: list[
-        tuple[str, float]
-    ] | None = None,
-) -> None:
-
-    _inject_lora_chain(
-        workflow,
-        enabled_loras or [],
-        model_source=_ref("6"),
-        clip_source=_ref("3"),
-        model_consumers=[
-            ("9", "model"),
-        ],
-        clip_consumers=[
-            ("10", "clip"),
-        ],
-    )
-
-
-    workflow["1"]["inputs"][
-        "image"
-    ] = primary_name
-
-
-    workflow["8"]["inputs"].update(
-        width=int(width),
-        height=int(height),
-    )
-
-
-    workflow["9"]["inputs"].update(
-        ref_boost=float(ref_boost),
-        ref_boost_a=float(ref_boost_a),
-    )
-
-
-    workflow["10"]["inputs"].update(
-        prompt=edit_prompt.strip(),
-        grounding_px=int(
-            grounding_px
-        ),
-    )
-
-
-    workflow["13"]["inputs"].update(
-        seed=int(seed),
-        steps=int(steps),
-        cfg=float(cfg),
-        sampler_name=sampler,
-        scheduler=scheduler,
-        denoise=1.0,
-    )
-
-
-    if second_name:
-
-        workflow["2"]["inputs"][
-            "image"
-        ] = second_name
-
-
-# ============================================================================
-# EXECUTE
-# ============================================================================
-
-def _execute_workflow(
-    workflow: dict[str, Any],
-) -> list[str]:
-
+def _execute_prompt(prompt: dict[str, Any]) -> str:
     import execution
     import server
 
-
-    loop = asyncio.new_event_loop()
-
-    asyncio.set_event_loop(loop)
-
-
-    server_instance = server.PromptServer(
-        loop
-    )
-
-
-    executor = execution.PromptExecutor(
-        server_instance,
-        cache_type=execution.CacheType.RAM_PRESSURE,
-        cache_args={
-            "lru": 0,
-            "ram": 2.0,
-            "ram_inactive": 8.0,
-        },
-    )
-
+    loop = asyncio.get_event_loop()
+    server_instance = server.PromptServer.instance
+    queue = server_instance.prompt_queue
 
     prompt_id = str(uuid.uuid4())
+    valid = execution.validate_prompt(prompt)
 
+    if not valid[0]:
+        raise RuntimeError(f"Invalid prompt structure: {valid[1]}")
 
-    save_id = _find_node(
-        workflow,
-        "SaveImage",
-    )
+    queue.put((0, prompt_id, prompt, extra_data := {}, valid[2]))
 
+    q = execution.PromptExecutor(server_instance, queue)
+    loop.run_until_complete(q.execute())
 
-    executor.execute(
-        workflow,
-        prompt_id,
-        extra_data={},
-        execute_outputs=[
-            save_id
-        ],
-    )
-
-
-    if not executor.success:
-
-        message = (
-            executor.status_messages[-1]
-            if executor.status_messages
-            else "ComfyUI execution failed"
-        )
-
-        raise RuntimeError(
-            str(message)
-        )
-
-
-    paths: list[pathlib.Path] = []
-
-
-    for output in (
-        executor.history_result
-        .get("outputs", {})
-        .values()
-    ):
-
-        for items in output.values():
-
-            if not isinstance(
-                items,
-                list,
-            ):
-
-                continue
-
-
-            for item in items:
-
-                if (
-                    not isinstance(
-                        item,
-                        dict,
-                    )
-                    or not item.get(
-                        "filename"
-                    )
-                ):
-
-                    continue
-
-
-                base = (
-                    OUTPUT
-                    if item.get(
-                        "type",
-                        "output",
-                    )
-                    == "output"
-                    else COMFY
-                    / item.get(
-                        "type",
-                        "output",
-                    )
-                )
-
-
-                candidate = (
-                    base
-                    / item.get(
-                        "subfolder",
-                        "",
-                    )
-                    / item["filename"]
-                )
-
-
-                if candidate.exists():
-
-                    paths.append(
-                        candidate
-                    )
-
-
-    if not paths:
-
-        paths = sorted(
-            [
-                pathlib.Path(item)
-                for item in glob.glob(
-                    str(
-                        OUTPUT
-                        / "**"
-                        / "*.png"
-                    ),
-                    recursive=True,
-                )
-            ],
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
-
-
-    if not paths:
-
-        raise RuntimeError(
-            "ComfyUI finished without "
-            "an output image"
-        )
-
-
-    return [
-        str(path)
-        for path in paths
-    ]
+    return prompt_id
 
 
 # ============================================================================
-# RUNTIME
+# GENERATION ENGINE
 # ============================================================================
 
-def _prepare_runtime(
+@spaces.GPU
+def generate_image(
+    prompt_text: str,
     base_model: str,
-    progress: gr.Progress | None = None,
-) -> str:
-
-    _ensure_comfy()
-
-    _scan_local_models()
-
-    _validate_required_assets()
-
-
-    if not LOCAL_BASE_MODELS:
-
-        raise RuntimeError(
-            "No diffusion models found in:\n"
-            f"{DIFFUSION_DIR}\n\n"
-            "Put your .safetensors diffusion "
-            "model inside that directory."
-        )
-
-
-    resolved_base_model = (
-        _validate_model_name(
-            base_model
-        )
-    )
-
-
-    _init_comfy_nodes()
-
-
-    return resolved_base_model
-
-
-# ============================================================================
-# GPU TIME
-# ============================================================================
-
-def get_gpu_duration(
-    *args: Any,
-    **kwargs: Any,
-) -> int:
-
-    steps = kwargs.get(
-        "steps",
-        args[11]
-        if len(args) > 11
-        else DEFAULT_STEPS,
-    )
-
-
-    width = kwargs.get(
-        "width",
-        args[5]
-        if len(args) > 5
-        else DEFAULT_WIDTH,
-    )
-
-
-    height = kwargs.get(
-        "height",
-        args[6]
-        if len(args) > 6
-        else DEFAULT_HEIGHT,
-    )
-
-
-    gen_budget = kwargs.get(
-        "gen_budget",
-        args[17]
-        if len(args) > 17
-        else 0,
-    )
-
-
-    if gen_budget and int(
-        gen_budget
-    ) > 0:
-
-        return max(
-            MIN_GPU_SECONDS,
-            min(
-                MAX_GPU_SECONDS,
-                int(gen_budget),
-            ),
-        )
-
-
-    lora_weights = kwargs.get(
-        "lora_weights",
-        args[19]
-        if len(args) > 19
-        else {},
-    ) or {}
-
-
-    lora_count = sum(
-        1
-        for value
-        in lora_weights.values()
-        if value
-        and abs(
-            float(value)
-        ) > 1e-6
-    )
-
-
-    estimate = int(
-        35
-        + (
-            int(width)
-            * int(height)
-            / 1_000_000
-        )
-        * int(steps)
-        * 3.0
-        * (
-            1
-            + 0.05
-            * lora_count
-        )
-    )
-
-
-    return max(
-        MIN_GPU_SECONDS,
-        min(
-            MAX_GPU_SECONDS,
-            estimate,
-        ),
-    )
-
-
-# ============================================================================
-# GENERATE
-# ============================================================================
-
-@spaces.GPU(
-    duration=get_gpu_duration
-)
-def generate(
-    mode: str,
-    prompt: str,
-    edit_prompt: str,
-    primary_image: str | None,
-    second_image: str | None,
-    width: int,
-    height: int,
-    target_megapixels: float,
-    grounding_px: int,
-    ref_boost: float,
-    ref_boost_a: float,
-    steps: int,
-    cfg: float,
-    sampler: str,
-    scheduler: str,
-    seed: int,
-    randomize_seed: bool,
-    gen_budget: float,
-    base_model: str,
-    lora_weights: dict[
-        str,
-        float
-    ] | None = None,
-    progress: gr.Progress = gr.Progress(
-        track_tqdm=True
-    ),
-) -> tuple[
-    list[str],
-    str,
-    int,
-]:
-
-    effective_seed = (
-        random.randint(
-            0,
-            2**32 - 1,
-        )
-        if (
-            randomize_seed
-            or int(seed) < 0
-        )
-        else int(seed)
-    )
-
-
-    staged: list[pathlib.Path] = []
-
-    total_start = time.time()
-
-    try:
-
-        _validate_request(
-            mode,
-            prompt,
-            edit_prompt,
-            primary_image,
-        )
-
-
-        effective_edit_prompt = (
-            edit_prompt
-            or prompt
-            or ""
-        ).strip()
-
-
-        if sampler not in SAMPLERS:
-
-            raise ValueError(
-                "unsupported sampler"
-            )
-
-
-        if scheduler not in SCHEDULERS:
-
-            raise ValueError(
-                "unsupported scheduler"
-            )
-
-
-        resolved_base_model = (
-            _prepare_runtime(
-                base_model,
-                progress,
-            )
-        )
-
-
-        enabled_loras: list[
-            tuple[str, float]
-        ] = []
-
-
-        for filename, weight in (
-            lora_weights or {}
-        ).items():
-
-            if filename not in LOCAL_LORAS:
-
-                raise ValueError(
-                    "local LoRA is not available: "
-                    + str(filename)
-                )
-
-
-            numeric_weight = float(
-                weight
-            )
-
-
-            if (
-                numeric_weight < -3.0
-                or numeric_weight > 3.0
-            ):
-
-                raise ValueError(
-                    "LoRA weight out of range: "
-                    + filename
-                )
-
-
-            if abs(
-                numeric_weight
-            ) > 1e-6:
-
-                validated_name = (
-                    _validate_lora_name(
-                        filename
-                    )
-                )
-
-
-                enabled_loras.append(
-                    (
-                        validated_name,
-                        numeric_weight,
-                    )
-                )
-
-
-        # --------------------------------------------------------------------
-        # T2I
-        # --------------------------------------------------------------------
-
-        if mode == "text2image":
-
-            width = max(
-                512,
-                min(
-                    MAX_WIDTH,
-                    int(width)
-                    // 64
-                    * 64,
-                ),
-            )
-
-
-            height = max(
-                512,
-                min(
-                    MAX_HEIGHT,
-                    int(height)
-                    // 64
-                    * 64,
-                ),
-            )
-
-
-            workflow = _t2i_workflow(
-                resolved_base_model
-            )
-
-
-        # --------------------------------------------------------------------
-        # EDIT
-        # --------------------------------------------------------------------
-
-        else:
-
-            (
-                primary_name,
-                width,
-                height,
-            ) = _prepare_edit_image(
-                primary_image,
-                target_megapixels,
-            )
-
-
-            staged.append(
-                INPUT / primary_name
-            )
-
-
-            second_name = (
-                _stage_image(
-                    second_image,
-                    "reference",
-                )
-                if second_image
-                else None
-            )
-
-
-            if second_name:
-
-                staged.append(
-                    INPUT / second_name
-                )
-
-
-            workflow = _edit_workflow(
-                bool(second_name),
-                resolved_base_model,
-            )
-
-
-        # --------------------------------------------------------------------
-        # INJECT
-        # --------------------------------------------------------------------
-
-        if mode == "text2image":
-
-            _inject_t2i(
-                workflow,
-                prompt=prompt,
-                width=width,
-                height=height,
-                steps=int(steps),
-                cfg=float(cfg),
-                sampler=sampler,
-                scheduler=scheduler,
-                seed=effective_seed,
-                enabled_loras=enabled_loras,
-            )
-
-        else:
-
-            _inject_edit(
-                workflow,
-                primary_name=primary_name,
-                second_name=second_name,
-                width=width,
-                height=height,
-                edit_prompt=effective_edit_prompt,
-                grounding_px=int(
-                    grounding_px
-                ),
-                ref_boost=float(
-                    ref_boost
-                ),
-                ref_boost_a=float(
-                    ref_boost_a
-                ),
-                steps=int(steps),
-                cfg=float(cfg),
-                sampler=sampler,
-                scheduler=scheduler,
-                seed=effective_seed,
-                enabled_loras=enabled_loras,
-            )
-
-
-        # --------------------------------------------------------------------
-        # METADATA
-        # --------------------------------------------------------------------
-
-        active_loras = [
-            {
-                "hf_filename": filename,
-                "weight": float(weight),
-            }
-            for filename, weight
-            in enabled_loras
-        ]
-
-
-        settings = build_settings(
-            mode=mode,
-            prompt=prompt,
-            edit_prompt=effective_edit_prompt,
-            width=width,
-            height=height,
-            target_megapixels=float(
-                target_megapixels
-            ),
-            grounding_px=int(
-                grounding_px
-            ),
-            ref_boost=float(
-                ref_boost
-            ),
-            ref_boost_a=float(
-                ref_boost_a
-            ),
-            steps=int(steps),
-            cfg=float(cfg),
-            sampler_name=sampler,
-            scheduler=scheduler,
-            seed=int(seed),
-            randomize_seed=bool(
-                randomize_seed
-            ),
-            gen_budget=float(
-                gen_budget
-            ),
-            effective_seed=effective_seed,
-            base_model=base_model,
-            custom_base_model=None,
-            catalog_loras=active_loras,
-            custom_loras=[],
-        )
-
-        t0 = time.time()
-        progress(
-            0.35,
-            desc=f"generating {mode}",
-        )
-
-
-        result_paths = _execute_workflow(
-            workflow
-        )
-
-
-        destination_dir = pathlib.Path(
-            tempfile.mkdtemp(
-                prefix="krea2_outputs_"
-            )
-        )
-
-
-        output_paths: list[str] = []
-
-
-        for index, source in enumerate(
-            result_paths
-        ):
-
-            destination = (
-                destination_dir
-                / f"output_{index}.png"
-            )
-
-
-            write_png_metadata(
-                source,
-                destination,
-                settings,
-            )
-
-
-            output_paths.append(
-                str(destination)
-            )
-
-        print(f"⏱️ Total: "f"{time.time() - total_start:.1f}s")
-        return (
-            output_paths,
-            (
-                f"done — "
-                f"{len(output_paths)} image(s), "
-                f"seed {effective_seed}"
-            ),
-            effective_seed,
-        )
-
-
-    except Exception as exc:
-
-        print(
-            traceback.format_exc(),
-            flush=True,
-        )
-
-
-        raise gr.Error(
-            "generation failed: "
-            + str(exc)[:500]
-        ) from exc
-
-
-    finally:
-
-        for path in staged:
-
-            try:
-
-                path.unlink(
-                    missing_ok=True
-                )
-
-            except OSError:
-
-                pass
-
-
-# ============================================================================
-# PROFILE
-# ============================================================================
-
-def _profile_from_values(
-    mode: str,
-    prompt: str,
-    edit_prompt: str,
+    image_a: str | None,
+    image_b: str | None,
     width: int,
     height: int,
     target_mp: float,
-    grounding: int,
+    grounding_px: int,
     ref_boost: float,
-    ref_boost_a: float,
     steps: int,
     cfg: float,
-    sampler: str,
+    sampler_name: str,
     scheduler: str,
     seed: int,
-    randomize: bool,
-    budget: float,
-    base_model: str,
-    catalog_loras: list[
-        dict[str, Any]
-    ] | None = None,
-) -> dict[str, Any]:
+    lora1_name: str,
+    lora1_weight: float,
+    lora2_name: str,
+    lora2_weight: float,
+    lora3_name: str,
+    lora3_weight: float,
+    progress=gr.Progress(track_tqdm=True),
+) -> tuple[str, str, str]:
 
-    return build_settings(
-        mode=mode,
-        prompt=prompt,
-        edit_prompt=edit_prompt,
-        width=int(width),
-        height=int(height),
-        target_megapixels=float(
-            target_mp
-        ),
-        grounding_px=int(
-            grounding
-        ),
-        ref_boost=float(
-            ref_boost
-        ),
-        ref_boost_a=float(
-            ref_boost_a
-        ),
-        steps=int(steps),
-        cfg=float(cfg),
-        sampler_name=sampler,
-        scheduler=scheduler,
-        seed=int(seed),
-        randomize_seed=bool(
-            randomize
-        ),
-        gen_budget=float(
-            budget
-        ),
-        effective_seed=int(
-            seed
-        ),
-        base_model=base_model,
-        custom_base_model=None,
-        catalog_loras=catalog_loras,
-        custom_loras=[],
+    start_time = time.time()
+    _ensure_comfy()
+    _init_comfy_nodes()
+    _validate_required_assets()
+
+    enabled_loras: list[tuple[str, float]] = []
+    for l_name, l_weight in [
+        (lora1_name, lora1_weight),
+        (lora2_name, lora2_weight),
+        (lora3_name, lora3_weight),
+    ]:
+        if l_name and l_name != "None":
+            valid_lora = _validate_lora_name(l_name)
+            enabled_loras.append((valid_lora, float(l_weight)))
+
+    print(f"\n[gen] --- Starting New Generation Task ---", flush=True)
+    print(f"[gen] Prompt: '{prompt_text}'", flush=True)
+    print(f"[gen] Base Model: {base_model}", flush=True)
+    print(f"[gen] Active LoRAs ({len(enabled_loras)}):", flush=True)
+    for name, weight in enabled_loras:
+        print(f"[gen]   - {name} (Strength: {weight})", flush=True)
+
+    mode = "edit" if image_a else "t2i"
+
+    if mode == "t2i":
+        workflow = _t2i_workflow(base_model)
+        
+        # Inject LoRAs
+        _inject_lora_chain(
+            workflow,
+            enabled_loras,
+            model_source=_ref("1"),
+            clip_source=_ref("2"),
+            model_consumers=[("4", "model")],
+            clip_consumers=[("5", "clip")],
+        )
+
+        # Set Prompt & Parameters
+        clip_encode_id = _find_node(workflow, "CLIPTextEncode")
+        workflow[clip_encode_id]["inputs"]["text"] = prompt_text
+
+        empty_latent_id = _find_node(workflow, "EmptyLatentImage")
+        workflow[empty_latent_id]["inputs"]["width"] = width
+        workflow[empty_latent_id]["inputs"]["height"] = height
+
+        ksampler_id = _find_node(workflow, "KSampler")
+        workflow[ksampler_id]["inputs"].update({
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler_name,
+            "scheduler": scheduler,
+        })
+
+    else:
+        has_b = bool(image_b)
+        workflow = _edit_workflow(has_b, base_model)
+
+        name_a, w_a, h_a = _prepare_edit_image(image_a, target_mp)
+        workflow["1"]["inputs"]["image"] = name_a
+
+        if has_b:
+            name_b, _, _ = _prepare_edit_image(image_b, target_mp)
+            workflow["2"]["inputs"]["image"] = name_b
+
+        workflow["8"]["inputs"]["width"] = w_a
+        workflow["8"]["inputs"]["height"] = h_a
+        workflow["9"]["inputs"]["ref_boost"] = ref_boost
+        workflow["9"]["inputs"]["ref_boost_a"] = ref_boost
+        workflow["10"]["inputs"]["prompt"] = prompt_text
+        workflow["10"]["inputs"]["grounding_px"] = grounding_px
+
+        _inject_lora_chain(
+            workflow,
+            enabled_loras,
+            model_source=_ref("5"),
+            clip_source=_ref("3"),
+            model_consumers=[("6", "model")],
+            clip_consumers=[("10", "clip")],
+        )
+
+        ksampler_id = _find_node(workflow, "KSampler")
+        workflow[ksampler_id]["inputs"].update({
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler_name,
+            "scheduler": scheduler,
+        })
+
+    print("[gen] Executing workflow graph...", flush=True)
+    prompt_id = _execute_prompt(workflow)
+
+    # Locating output image
+    output_files = glob.glob(str(OUTPUT / "*.png"))
+    if not output_files:
+        raise RuntimeError("Generation failed: No output image found in output directory.")
+
+    latest_image_path = max(output_files, key=os.path.getmtime)
+    
+    # Process output image to temp location
+    temp_output_path = pathlib.Path(tempfile.gettempdir()) / f"out_{uuid.uuid4().hex}.png"
+    shutil.copy(latest_image_path, temp_output_path)
+
+    generation_time = time.time() - start_time
+    print(f"[gen] Image generation complete in {generation_time:.2f} seconds.", flush=True)
+
+    status_log = (
+        f"Mode: {mode.upper()}\n"
+        f"Base Model: {base_model}\n"
+        f"Generation Time: {generation_time:.2f}s\n"
+        f"Active LoRAs: {len(enabled_loras)}\n"
+        f"Seed: {seed}"
     )
 
+    settings_dump = json.dumps({
+        "prompt": prompt_text,
+        "base_model": base_model,
+        "seed": seed,
+        "steps": steps,
+        "cfg": cfg,
+        "sampler": sampler_name,
+        "scheduler": scheduler,
+        "loras": enabled_loras,
+    }, indent=2)
+
+    return str(temp_output_path), status_log, settings_dump
+
 
 # ============================================================================
-# UI
+# GRADIO INTERFACE CONSTRUCTION
 # ============================================================================
 
-def create_ui() -> gr.Blocks:
+def build_ui() -> gr.Blocks:
+    _ensure_model_directories()
+    _scan_local_models()
 
-    with gr.Blocks(
-        title="Krea 2 Turbo Image Generator",
-        theme=gr.themes.Soft(),
-    ) as demo:
+    lora_options = ["None"] + LOCAL_LORAS
+    default_base = LOCAL_BASE_MODELS[0] if LOCAL_BASE_MODELS else ""
+
+    with gr.Blocks(title="Krea2 ComfyUI Studio") as demo:
+        gr.Markdown("# Krea2 Image Generation & Edit Studio")
 
         with gr.Row():
-
-            with gr.Column(
-                scale=1
-            ):
-
-                mode = gr.Radio(
-                    [
-                        "text2image",
-                        "edit",
-                    ],
-                    value="text2image",
-                    label="mode",
+            with gr.Column(scale=1):
+                prompt_input = gr.Textbox(
+                    label="Prompt",
+                    placeholder="Enter your generation prompt here...",
+                    lines=3,
                 )
 
-
-                base_model = gr.Dropdown(
+                base_model_dropdown = gr.Dropdown(
+                    label="Base Diffusion Model",
                     choices=LOCAL_BASE_MODELS,
-                    value=(
-                        LOCAL_BASE_MODELS[0]
-                        if LOCAL_BASE_MODELS
-                        else None
-                    ),
-                    label="base diffusion model",
-                    allow_custom_value=False,
+                    value=default_base,
                 )
 
+                with gr.Accordion("Reference Images (Edit Mode)", open=False):
+                    image_a_input = gr.Image(label="Source Image A", type="filepath")
+                    image_b_input = gr.Image(label="Source Image B (Optional)", type="filepath")
+                    target_mp_slider = gr.Slider(0.25, MAX_TARGET_MP, value=DEFAULT_TARGET_MP, step=0.05, label="Target Megapixels")
+                    ref_boost_slider = gr.Slider(0.0, 2.0, value=DEFAULT_REF_BOOST, step=0.1, label="Reference Boost")
+                    grounding_slider = gr.Slider(64, 2048, value=DEFAULT_GROUNDING, step=64, label="Grounding Pixels")
 
-                gr.Markdown(
-                    "Models are loaded from "
-                    f"`{DIFFUSION_DIR}`"
-                )
-
-
-                with gr.Column(
-                    visible=False
-                ) as image_inputs:
-
-                    primary = gr.Image(
-                        type="filepath",
-                        label="primary image / scene",
-                    )
-
-                    second = gr.Image(
-                        type="filepath",
-                        label="optional second reference",
-                    )
-
-
-                prompt = gr.Textbox(
-                    value=(
-                        "A cinematic portrait "
-                        "in soft natural light"
-                    ),
-                    label="prompt",
-                    lines=3,
-                )
-
-
-                edit_prompt = gr.Textbox(
-                    label="edit instruction",
-                    lines=3,
-                    visible=False,
-                    placeholder=(
-                        "recolor the jacket "
-                        "to matte black"
-                    ),
-                )
-
-
-                with gr.Column() as t2i_resolution:
-
+                with gr.Accordion("LoRA Selection Stack", open=True):
                     with gr.Row():
-
-                        width = gr.Slider(
-                            512,
-                            MAX_WIDTH,
-                            value=DEFAULT_WIDTH,
-                            step=64,
-                            label="width",
-                        )
-
-                        height = gr.Slider(
-                            512,
-                            MAX_HEIGHT,
-                            value=DEFAULT_HEIGHT,
-                            step=64,
-                            label="height",
-                        )
-
-
-                with gr.Column(
-                    visible=False
-                ) as edit_controls:
-
-                    target_mp = gr.Slider(
-                        0.25,
-                        MAX_TARGET_MP,
-                        value=DEFAULT_TARGET_MP,
-                        step=0.05,
-                        label="target megapixels",
-                    )
-
-                    grounding = gr.Slider(
-                        384,
-                        1536,
-                        value=DEFAULT_GROUNDING,
-                        step=32,
-                        label="grounding resolution",
-                    )
-
-                    ref_boost = gr.Slider(
-                        0.0,
-                        12.0,
-                        value=DEFAULT_REF_BOOST,
-                        step=0.1,
-                        label="primary reference strength",
-                    )
-
-                    ref_boost_a = gr.Slider(
-                        0.0,
-                        12.0,
-                        value=DEFAULT_REF_BOOST,
-                        step=0.1,
-                        label="second reference strength",
-                    )
-
-
-                # ----------------------------------------------------------------
-                # LORAS
-                # ----------------------------------------------------------------
-
-                with gr.Accordion(
-                    f"Local LoRAs "
-                    f"({len(LOCAL_LORAS)} available)",
-                    open=False,
-                ):
-
-                    gr.Markdown(
-                        "LoRAs are loaded from "
-                        f"`{LORA_ROOT}`. "
-                        "Set any LoRA weight above zero "
-                        "or below zero to enable it. "
-                        "Multiple LoRAs can be used together."
-                    )
-
-
-                    if not LOCAL_LORAS:
-
-                        gr.Markdown(
-                            "⚠️ No LoRAs found."
-                        )
-
-
-                    lora_slider_map: dict[
-                        str,
-                        gr.Slider,
-                    ] = {}
-
-
-                    for filename in LOCAL_LORAS:
-
-                        lora_slider_map[
-                            filename
-                        ] = gr.Slider(
-                            minimum=-3.0,
-                            maximum=3.0,
-                            value=0.0,
-                            step=0.05,
-                            label=filename,
-                        )
-
-
-                with gr.Accordion(
-                    "sampling",
-                    open=False,
-                ):
-
-                    steps = gr.Slider(
-                        4,
-                        40,
-                        value=DEFAULT_STEPS,
-                        step=1,
-                        label="steps",
-                    )
-
-
-                    cfg = gr.Slider(
-                        1.0,
-                        5.0,
-                        value=DEFAULT_CFG,
-                        step=0.1,
-                        label="CFG",
-                    )
-
-
+                        lora1_dropdown = gr.Dropdown(label="LoRA 1", choices=lora_options, value="None")
+                        lora1_weight = gr.Slider(-2.0, 2.0, value=1.0, step=0.05, label="Strength 1")
                     with gr.Row():
+                        lora2_dropdown = gr.Dropdown(label="LoRA 2", choices=lora_options, value="None")
+                        lora2_weight = gr.Slider(-2.0, 2.0, value=1.0, step=0.05, label="Strength 2")
+                    with gr.Row():
+                        lora3_dropdown = gr.Dropdown(label="LoRA 3", choices=lora_options, value="None")
+                        lora3_weight = gr.Slider(-2.0, 2.0, value=1.0, step=0.05, label="Strength 3")
 
-                        sampler = gr.Dropdown(
-                            SAMPLERS,
-                            value=DEFAULT_SAMPLER,
-                            label="sampler",
-                        )
+                with gr.Accordion("Advanced Parameters", open=False):
+                    with gr.Row():
+                        width_slider = gr.Slider(64, MAX_WIDTH, value=DEFAULT_WIDTH, step=64, label="Width")
+                        height_slider = gr.Slider(64, MAX_HEIGHT, value=DEFAULT_HEIGHT, step=64, label="Height")
+                    with gr.Row():
+                        steps_slider = gr.Slider(1, 50, value=DEFAULT_STEPS, step=1, label="Steps")
+                        cfg_slider = gr.Slider(0.0, 20.0, value=DEFAULT_CFG, step=0.1, label="CFG")
+                    with gr.Row():
+                        sampler_dropdown = gr.Dropdown(label="Sampler", choices=SAMPLERS, value=DEFAULT_SAMPLER)
+                        scheduler_dropdown = gr.Dropdown(label="Scheduler", choices=SCHEDULERS, value=DEFAULT_SCHEDULER)
+                    seed_number = gr.Number(label="Seed", value=DEFAULT_SEED, precision=0)
 
-                        scheduler = gr.Dropdown(
-                            SCHEDULERS,
-                            value=DEFAULT_SCHEDULER,
-                            label="scheduler",
-                        )
+                generate_btn = gr.Button("Generate", variant="primary")
 
+            with gr.Column(scale=1):
+                image_output = gr.Image(label="Generated Result")
+                status_output = gr.Textbox(label="Execution Status & Time Log", interactive=False)
+                settings_output = gr.Code(label="Generation Parameters JSON", language="json")
 
-                with gr.Row():
-
-                    seed = gr.Number(
-                        value=DEFAULT_SEED,
-                        precision=0,
-                        label="seed",
-                    )
-
-                    randomize = gr.Checkbox(
-                        value=False,
-                        label="randomize seed",
-                    )
-
-
-                gen_budget = gr.Slider(
-                    0,
-                    MAX_GPU_SECONDS,
-                    value=0,
-                    step=10,
-                    label="GPU budget (0 = automatic)",
-                )
-
-
-                button = gr.Button(
-                    "generate",
-                    variant="primary",
-                    size="lg",
-                )
-
-
-            with gr.Column(
-                scale=1
-            ):
-
-                gallery = gr.Gallery(
-                    label="output",
-                    columns=2,
-                    height=600,
-                )
-
-                status = gr.Textbox(
-                    label="status",
-                    interactive=False,
-                )
-
-                used_seed = gr.Number(
-                    label="used seed",
-                    interactive=False,
-                )
-
-
-        # ====================================================================
-        # MODE
-        # ====================================================================
-
-        def on_mode_change(
-            value: str,
-        ):
-
-            editing = (
-                value == "edit"
-            )
-
-            return (
-                gr.update(
-                    visible=editing
-                ),
-                gr.update(
-                    visible=not editing
-                ),
-                gr.update(
-                    visible=editing
-                ),
-                gr.update(
-                    visible=editing
-                ),
-            )
-
-
-        mode.change(
-            on_mode_change,
-            inputs=[mode],
+        generate_btn.click(
+            fn=generate_image,
+            inputs=[
+                prompt_input,
+                base_model_dropdown,
+                image_a_input,
+                image_b_input,
+                width_slider,
+                height_slider,
+                target_mp_slider,
+                grounding_slider,
+                ref_boost_slider,
+                steps_slider,
+                cfg_slider,
+                sampler_dropdown,
+                scheduler_dropdown,
+                seed_number,
+                lora1_dropdown,
+                lora1_weight,
+                lora2_dropdown,
+                lora2_weight,
+                lora3_dropdown,
+                lora3_weight,
+            ],
             outputs=[
-                image_inputs,
-                t2i_resolution,
-                edit_controls,
-                edit_prompt,
+                image_output,
+                status_output,
+                settings_output,
             ],
         )
-
-
-        # ====================================================================
-        # LORA
-        # ====================================================================
-
-        all_lora_filenames = list(
-            lora_slider_map.keys()
-        )
-
-        all_lora_sliders = list(
-            lora_slider_map.values()
-        )
-
-
-        def _catalog_weights(
-            values: list[Any],
-        ) -> dict[str, float]:
-
-            return {
-                filename: float(weight)
-                for filename, weight
-                in zip(
-                    all_lora_filenames,
-                    values,
-                )
-                if (
-                    weight
-                    and abs(
-                        float(weight)
-                    ) > 1e-6
-                )
-            }
-
-
-        # ====================================================================
-        # GENERATION WRAPPER
-        # ====================================================================
-
-        def _generate_wrapper(
-            *values,
-        ):
-
-            base_values = values[:18]
-
-            base_model_value = values[18]
-
-            lora_values = values[19:]
-
-
-            lora_weights = (
-                _catalog_weights(
-                    list(lora_values)
-                )
-            )
-
-
-            return generate(
-                *base_values,
-                base_model=base_model_value,
-                lora_weights=lora_weights,
-            )
-
-
-        generation_inputs = [
-
-            mode,
-            prompt,
-            edit_prompt,
-            primary,
-            second,
-
-            width,
-            height,
-
-            target_mp,
-
-            grounding,
-            ref_boost,
-            ref_boost_a,
-
-            steps,
-            cfg,
-
-            sampler,
-            scheduler,
-
-            seed,
-            randomize,
-
-            gen_budget,
-
-            base_model,
-
-            *all_lora_sliders,
-        ]
-
-
-        button.click(
-            _generate_wrapper,
-            inputs=generation_inputs,
-            outputs=[
-                gallery,
-                status,
-                used_seed,
-            ],
-        )
-
 
     return demo
 
 
-# ============================================================================
-# STARTUP
-# ============================================================================
-
-def _on_startup() -> None:
-
-    if (
-        os.environ.get(
-            "KREA_SKIP_STARTUP"
-        )
-        == "1"
-    ):
-
-        return
-
-
-    try:
-
-        print(
-            "=" * 70,
-            flush=True,
-        )
-
-        print(
-            "Krea 2 Turbo Starting",
-            flush=True,
-        )
-
-        print(
-            "=" * 70,
-            flush=True,
-        )
-
-
-        print(
-            "[startup] ROOT:",
-            ROOT,
-            flush=True,
-        )
-
-        print(
-            "[startup] COMFY:",
-            COMFY,
-            flush=True,
-        )
-
-        print(
-            "[startup] MODELS:",
-            MODELS,
-            flush=True,
-        )
-
-
-        _ensure_comfy()
-
-
-        _scan_local_models()
-
-
-        try:
-
-            _validate_required_assets()
-
-        except Exception as exc:
-
-            print(
-                "[startup] model warning:",
-                str(exc),
-                flush=True,
-            )
-
-
-        _init_comfy_nodes()
-
-
-        print(
-            "[startup] ready",
-            flush=True,
-        )
-
-
-    except Exception as exc:
-
-        print(
-            "[startup] setup incomplete "
-            f"({type(exc).__name__}: {exc})",
-            flush=True,
-        )
-
-        print(
-            "[startup] generation will retry setup",
-            flush=True,
-        )
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-_on_startup()
-
-_scan_local_models()
-
-demo = create_ui()
-
-demo.queue()
-
-
 if __name__ == "__main__":
-
-    demo.launch(
-        share=True,
-    )
+    _ensure_comfy()
+    app = build_ui()
+    app.queue().launch()
