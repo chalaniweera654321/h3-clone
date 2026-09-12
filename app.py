@@ -193,16 +193,76 @@ def wait_history(pid):
 
 
 def fetch_video(history):
-    items=[]
-    for out in history.get('outputs',{}).values():
-        for key in ('videos','gifs','files'):
-            items += out.get(key,[]) or []
-    if not items: raise RuntimeError('ComfyUI finished but returned no video.')
-    item=next((x for x in items if 'UltimateUpscale' in x.get('filename','')),items[-1])
-    r=requests.get(COMFY_URL+'/view',params={'filename':item['filename'],'subfolder':item.get('subfolder',''),'type':item.get('type','output')},timeout=600)
+    items = []
+
+    # ComfyUI can expose SaveVideo results under "images",
+    # while other video nodes may use "videos", "gifs", or "files".
+    for node_id, out in history.get('outputs', {}).items():
+        for key in ('images', 'videos', 'gifs', 'files'):
+            for item in (out.get(key, []) or []):
+                if not isinstance(item, dict):
+                    continue
+
+                filename = item.get('filename', '')
+                if not filename:
+                    continue
+
+                # Only accept actual video files
+                if filename.lower().endswith(
+                    ('.mp4', '.webm', '.mkv', '.mov', '.avi', '.gif')
+                ):
+                    items.append(item)
+
+    if not items:
+        # Give us useful debugging information instead of the vague error.
+        outputs = history.get('outputs', {})
+        summary = {
+            node_id: list(node_output.keys())
+            for node_id, node_output in outputs.items()
+        }
+        raise RuntimeError(
+            'ComfyUI finished, but no video file was found in history. '
+            f'Output keys: {json.dumps(summary, indent=2)}'
+        )
+
+    # Prefer the Ultimate Upscale result
+    item = next(
+        (
+            x for x in items
+            if 'UltimateUpscale' in x.get('filename', '')
+        ),
+        items[-1]
+    )
+
+    log(f"Found video: {item.get('filename')}")
+    log(f"Video subfolder: {item.get('subfolder', '')}")
+    log(f"Video type: {item.get('type', 'output')}")
+
+    r = requests.get(
+        COMFY_URL + '/view',
+        params={
+            'filename': item['filename'],
+            'subfolder': item.get('subfolder', ''),
+            'type': item.get('type', 'output')
+        },
+        timeout=600
+    )
     r.raise_for_status()
-    out=Path('/tmp/minimax_h3_results'); out.mkdir(exist_ok=True)
-    p=out/(uuid.uuid4().hex+'_'+item['filename']); p.write_bytes(r.content)
+
+    out_dir = Path('/tmp/minimax_h3_results')
+    out_dir.mkdir(exist_ok=True)
+
+    p = out_dir / (
+        uuid.uuid4().hex + '_' + Path(item['filename']).name
+    )
+
+    p.write_bytes(r.content)
+
+    if not p.exists() or p.stat().st_size == 0:
+        raise RuntimeError(f'Video download was empty: {p}')
+
+    log(f"Downloaded video: {p} ({p.stat().st_size / 1024 / 1024:.2f} MB)")
+
     return str(p)
 
 
